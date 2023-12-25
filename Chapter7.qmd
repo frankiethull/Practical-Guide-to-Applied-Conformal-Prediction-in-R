@@ -1,0 +1,397 @@
+---
+title: "Chapter 7 | Conformal Prediction for Regression"
+author: "frankiethull"
+format: gfm
+---
+
+## Chapter 7 to Practical Guide to Applied Conformal Prediction in **R**:
+   
+The following code is based on the recent book release: *Practical Guide to Applied Conformal Prediction in Python*. After posting a fuzzy GIF on X & receiving a lot of requests for a blog or Github repo, below is Chapter 7 of the practical guide with applications in R, instead of Python.   
+
+While the book is not free, the Python code is open-source and a located at the following github repo:   
+*https://github.com/PacktPublishing/Practical-Guide-to-Applied-Conformal-Prediction/blob/main/Chapter_07.ipynb*  
+
+While this is not copy/paste direct replica of the python notebook or book, this is a lite, supplemental R guide, & documentation for R users. 
+
+We will follow the example of calculating conformal prediction intervals manually, then use the probably package. 
+
+### R setup for tidymodeling:
+```{r}
+# using tidymodel framework:
+library(tidymodels) # ml modeling api
+library(probably)   # conformal ints
+library(dplyr)      # pliers keep it tidy 
+library(ggplot2)    # data viz
+library(reticulate) # pass the python example dataset :)
+library(doParallel) # model tuning made fast
+```
+
+```{r}
+# reticulate::py_install("openml", pip = TRUE)
+# reticulate::py_install("pandas", pip = TRUE)
+```
+### Load Dataset
+get the matching dataset via openml, quick python chunk from the original ipynb:
+```{python}
+import openml
+import pandas as pd
+
+# List of datasets from openml https://docs.openml.org/Python-API/
+datasets_df = openml.datasets.list_datasets(output_format="dataframe")
+print(datasets_df.head(n=10))
+
+datasets_df.set_index('did', inplace = True)
+
+# California housing dataset https://www.openml.org/search?type=data&status=active&id=43939
+dataset = openml.datasets.get_dataset(43939)
+
+
+# Print a summary
+print(
+    f"This is dataset '{dataset.name}', the target feature is "
+    f"'{dataset.default_target_attribute}'"
+)
+print(f"URL: {dataset.url}")
+print(dataset.description[:500])
+
+# openml API
+X, y, categorical_indicator, attribute_names = dataset.get_data(
+    dataset_format="array", target=dataset.default_target_attribute
+)
+df = pd.DataFrame(X, columns=attribute_names)
+df["class"] = y
+```
+#### pass the python df to R:
+```{r}
+df <- py$df
+```
+
+data checks:
+```{r}
+df |> str()
+```
+na checks:
+```{r}
+colSums(is.na(df))
+```
+
+```{r}
+df <- df |>
+      na.omit()
+```
+
+data processing for regression:
+```{r}
+
+# holdout 10% of data for calibration
+cal_holdout <- dplyr::slice_sample(df, prop = .1) 
+
+# proceed typical test/train splitting, a tidymodels workflow based on ipynb:
+model_df <- df |> anti_join(cal_holdout)
+
+split <- model_df |> initial_split(prop = 0.99)
+training <- training(split)
+testing  <- testing(split)
+```
+
+model building:
+```{r}
+# random forest model spec, specifying 'mode' and 'engine'
+rf_model_spec <- 
+    rand_forest(trees = 200, min_n = 5) %>% 
+    set_mode("regression") %>% 
+    set_engine("ranger")
+
+rf_wflow <- workflow(class ~ ., rf_model_spec)
+rf_model_fit <- rf_wflow |> fit(data = training)
+
+
+```
+
+## ICP Section
+
+```{r}
+# make point predictions 
+pred_cal  <- rf_model_fit |> predict(cal_holdout)
+pred_test <- rf_model_fit |> predict(testing)
+
+
+data.frame(
+  y =     cal_holdout$class,
+  y_hat = pred_cal$.pred
+) |>
+ggplot() + 
+  geom_point(aes(x = y, y = y_hat), color = "darkcyan", alpha = .9) +
+  theme_minimal() + 
+  labs(title = "Prediction Error for RandomForestRegressor")
+
+```
+
+```{r}
+alpha <- 0.05
+n_cal <- nrow(cal_holdout)
+
+y_cal <- cal_holdout$class
+y_pred_cal <- pred_cal$.pred
+
+# calculate calibraion errors
+y_cal_error <- abs(y_cal - y_pred_cal)
+
+ceiling((n_cal+1)*(1-alpha))/n_cal
+```
+```{r}
+#calculate q_hat on the calibration set
+q_yhat_cal = quantile(y_cal_error,ceiling((n_cal+1)*(1-alpha))/n_cal)
+q_yhat_cal
+```
+
+```{r}
+  ggplot() +
+  geom_histogram(aes(x = y_cal_error), fill = "lightblue") + 
+  geom_vline(aes(xintercept = q_yhat_cal), color = "red", linetype = 2) +
+  labs(
+    title = "Histogram of Calibration Errors",
+    x = "Calibration Error",
+    y = "Frequency"
+  ) + 
+  theme_minimal() 
+```
+
+
+```{r}
+# predicted_df 
+pred_test |>
+  mutate(
+    lower_bound = .pred - q_yhat_cal,
+    upper_bound = .pred + q_yhat_cal,
+    actual = testing$class
+) |>
+  mutate(
+    index = row_number()
+  ) |>
+ ggplot(aes(x = index))  +
+  geom_ribbon(aes(ymin = lower_bound, 
+                  ymax = upper_bound), fill = "grey",
+              alpha = 0.5) +
+  geom_line(aes(y = actual, color = "Actual")) +
+  geom_line(aes(y = .pred, color = "Predicted")) + 
+  theme_minimal() +
+  labs(
+    title = "Actual vs Predicted Values with Prediction Interval"
+  ) +
+  theme(legend.title = element_blank(), 
+        legend.position = c(.9,.9))
+```
+### using probably 
+
+doing the routine in a 'tidy' way, one can use *probably* package for split conformal inference. probably is a tidymodels extension package allowing for various interval and post-calibration modeling techniques. 
+```{r}
+
+conformal_split <- int_conformal_split(rf_model_fit, 
+                                       cal_data = cal_holdout)
+
+conformal_split_test <- predict(conformal_split, testing, level = 0.95)
+
+conformal_split_test |>
+  mutate(
+    actual = testing$class,
+    index = row_number()
+    ) |>
+  ggplot(aes(x = index))  +
+  geom_ribbon(aes(ymin = .pred_lower, 
+                  ymax = .pred_upper), fill = "grey",
+              alpha = 0.5) +
+  geom_line(aes(y = actual, color = "Actual")) +
+  geom_line(aes(y = .pred, color = "Predicted")) + 
+  theme_minimal() +
+  labs(
+    title = "Actual vs Predicted Values with Prediction Interval",
+    subtitle = "Using {probably}"
+  ) +
+  theme(legend.title = element_blank(), 
+        legend.position = c(.9,.9))
+
+```
+
+
+## CQR Section
+
+compute correlation between features and also between features and the target
+```{r}
+df |>
+  select(-ocean_proximity) |> 
+  select_if(is.numeric) |>
+  corrr::correlate() |>
+  #corrr::rearrange() |>
+  corrr::shave() 
+  #corrr::rplot()
+```
+
+```{r}
+df |>
+  ggplot() + 
+  geom_histogram(aes(class), fill = "lightblue") +
+  theme_minimal() +
+  labs(title = "histogram of house prices",
+       x = "median price of houses") +
+  scale_x_continuous(labels = scales::dollar_format())
+```
+### Optimize underlying tree model
+```{r}
+
+folds <- vfold_cv(training, v = 5)
+
+params_distributions <- 
+  expand.grid(
+    trees      = c(10, 25),
+    tree_depth = c(3, 10),
+    mtry       = c(50, 100),
+    learn_rate = c(.01, .2)
+)
+
+model_recipe <- recipe(class ~ ., training)
+
+# refer to api documentation on how-to pass quantile objective to various engines 
+gbm_spec <- 
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+      ) |> 
+    set_mode("regression") |> 
+    set_engine("xgboost", num_threads = 8)
+
+# pre training settings ---
+cluster <- makePSOCKcluster(8)
+registerDoParallel(cluster)
+
+# model creation ---
+gbm_results <-
+  finetune::tune_race_anova(
+    workflow() %>%
+      add_recipe(model_recipe) %>%
+      add_model(gbm_spec),
+    resamples = folds,
+    grid = params_distributions,
+    control = finetune::control_race(),
+    metrics = metric_set(rmse)
+  )
+
+# post training settings ---
+stopCluster(cluster)
+registerDoSEQ()
+
+finalize_gbm <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(gbm_spec) %>% 
+  finalize_workflow(select_best(gbm_results))
+
+best_gbm <- finalize_gbm |> fit(training)
+
+show_best(gbm_results)
+```
+boosted model point forecaster with naive & cqr intervals using probably 
+```{r}
+# naive
+xgb_conformal_split <- int_conformal_split(best_gbm, 
+                                           cal_data = cal_holdout)
+
+xgb_conformal_split_test <- predict(conformal_split, testing, level = 0.80)
+
+# cqr
+xgb_conformal_cqr <- int_conformal_quantile(best_gbm,
+                                            train_data = training,
+                                            cal_data = cal_holdout,
+                                            level = 0.80)
+
+
+xgb_conformal_cqr_test <- predict(xgb_conformal_cqr, testing)
+
+
+```
+
+range plot for naive method:
+```{r}
+testing |>
+  select(class) |> 
+  bind_cols(xgb_conformal_split_test) |>
+  mutate(
+    coverage = ifelse(class < .pred_upper & class > .pred_lower, "yes", "no")
+  ) |>
+  ggplot() +
+  geom_segment(aes(x = class, xend = class, 
+                   y = .pred_lower, yend = .pred_upper, 
+                   color = coverage), alpha = .8) + 
+  geom_point(aes(x = class, y = .pred, 
+                 color = coverage), size = 2) +
+  labs(subtitle = "naive interval",
+       x = "actual") +
+  theme_minimal() +
+  theme(legend.position = "bottom") + 
+  coord_equal() + 
+  geom_abline(slope = 1)
+```
+```{r}
+testing |>
+  select(class) |> 
+  bind_cols(xgb_conformal_cqr_test) |>
+  mutate(
+    coverage = ifelse(class < .pred_upper & class > .pred_lower, "yes", "no")
+  ) |>
+  ggplot() +
+  geom_segment(aes(x = class, xend = class, 
+                   y = .pred_lower, yend = .pred_upper, 
+                   color = coverage), alpha = .8) + 
+  geom_point(aes(x = class, y = .pred, 
+                 color = coverage), size = 2) +
+  labs(subtitle = "cqr interval",
+       x = "actual") +
+  theme_minimal() +
+  theme(legend.position = "bottom") + 
+  coord_equal() + 
+  geom_abline(slope = 1)
+```
+
+bin plot 
+```{r}
+testing |> 
+  select(class) |>
+  mutate(
+    bin = ntile(n = 10)
+  ) |>
+  bind_cols(xgb_conformal_cqr_test) |>
+   mutate(
+    coverage = ifelse(class < .pred_upper & class > .pred_lower, "yes", "no")
+  ) |>
+  group_by(bin) |>
+  count(coverage) |>
+  ggplot() +
+  geom_col(aes(x = bin, y = n, fill = coverage)) +
+  labs(title = "CQR: prediction interval coverage",
+       subtitle = "by binned housing price") +
+  theme_minimal()
+
+```
+
+```{r}
+testing |> 
+  select(class) |>
+  mutate(
+    bin = ntile(n = 10)
+  ) |>
+  bind_cols(xgb_conformal_cqr_test) |>
+   mutate(
+    coverage_width = .pred_upper - .pred_lower
+  ) |>
+  group_by(bin) |>
+  summarize(
+    mean_width = mean(coverage_width)
+  ) |>
+  ggplot() + 
+  geom_col(aes(x = bin, y = mean_width), fill = "darkcyan") + 
+  labs(title = "CQR: prediction interval width",
+       subtitle = "by binned housing price") + 
+  theme_minimal()
+```
+

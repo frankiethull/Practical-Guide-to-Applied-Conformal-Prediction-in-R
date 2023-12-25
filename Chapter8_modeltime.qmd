@@ -1,0 +1,203 @@
+---
+title: "Chapter 8 | Conformal Prediction for Time Series and Forecasting"
+author: "frankiethull"
+format: gfm
+---
+
+## Chapter 8 to Practical Guide to Applied Conformal Prediction in **R**:
+   
+The following code is based on the recent book release: *Practical Guide to Applied Conformal Prediction in Python*. After posting a fuzzy GIF on X & receiving a lot of requests for a blog or Github repo, below is Chapter 8 of the practical guide with applications in R, instead of Python.   
+
+While the book is not free, the Python code is open-source and a located at the following github repo:   
+*https://github.com/PacktPublishing/Practical-Guide-to-Applied-Conformal-Prediction/blob/main/Chapter_08_NixtlaStatsforecastipynb*  
+
+While this is not copy/paste direct replica of the python notebook or book, this is a lite, supplemental R guide, & documentation for R users. 
+
+We will follow the example of time series and forecasting using fable & conformal prediction intervals using the modeltime package. 
+
+### R setup for fable & modeltime:
+```{r}
+# using tidymodel framework:
+library(tidymodels) # ml modeling api
+library(modeltime)  # tidy time series
+library(fable)      # tidy time series
+library(timetk)     # temporal kit
+library(tsibble)    # temporal kit
+library(dplyr)      # pliers keep it tidy 
+library(ggplot2)    # data viz
+library(reticulate) # pass the python example dataset :)
+library(doParallel) # model tuning made fast
+```
+
+### Load the dataset
+```{r}
+train = read.csv('https://auto-arima-results.s3.amazonaws.com/M4-Hourly.csv')
+test = read.csv('https://auto-arima-results.s3.amazonaws.com/M4-Hourly-test.csv')
+```
+
+
+```{r}
+train |> head()
+```
+### Train the models 
+
+
+we will only use the first 4 series of the dataset to reduce the total computational time.
+
+
+```{r}
+n_series <- 4
+uids <- paste0("H", seq(1:n_series))
+
+train <- train |> filter(unique_id %in% uids) |> group_by(unique_id)
+test  <- test  |> filter(unique_id %in% uids)
+
+```
+
+
+```{r}
+train |>
+  ggplot() +
+  geom_line(aes(x = ds, y = y, color = "train")) +
+  geom_line(inherit.aes = FALSE,
+            data = test, 
+            aes(x = ds, y = y, color = "test")) + 
+  facet_wrap(~unique_id, scales = "free") +
+  theme_minimal() + 
+  theme(
+    legend.position = "top"
+  ) + 
+  labs(subtitle = "data split")
+  
+  
+```
+#### Create a list of models using fable
+for this example we are using fable library    
+fable is a 'tidy' version of the forecast library.   
+
+Both are user-friendly & have accompanying books (fpp2 & fpp3 by rob hyndman). 
+##### plot prediction intervals
+```{r}
+train_fbl <- train |> tsibble::as_tsibble(index = ds, key = unique_id)
+test_fbl  <- test  |> tsibble::as_tsibble(index = ds, key = unique_id)
+
+train_fbl |>
+  model(
+    ets = ETS(y),
+    naive = NAIVE(y),
+    rw = RW(y),
+    snaive = SNAIVE(y)
+  ) |>
+  forecast(new_data = test_fbl) |>
+  autoplot() + 
+  geom_line(inherit.aes = FALSE,
+            data = train_fbl,
+            aes(x = ds, y = y, color = "train")) +
+  theme_minimal() + 
+  labs(subtitle = "{fable} predictions")
+
+```
+
+```{r}
+train_fbl |>
+  model(
+    auto_arima = ARIMA(y)
+  ) |>
+  forecast(new_data = test_fbl) |>
+  autoplot() + 
+  geom_line(inherit.aes = FALSE,
+            data = train_fbl,
+            aes(x = ds, y = y, color = "train")) +
+  theme_minimal() +
+  labs(subtitle = "AutoARIMA via {fable}")
+
+```
+
+
+The next section will switch to a modeltime workflow. modeltime is the tidymodels for time series. 
+
+#### Conformal Prediction with modeltime
+
+There are two methods for conformal prediction in modeltime, it is the only tidy timeseries library I know of that supports conformal prediction options internally and by default.  
+
+The default method is quantile method but there is an option for split method as well.
+
+##### train models 
+```{r}
+# let's use for one location:
+mt_train <- train |> filter(unique_id == uids[[1]]) |> mutate(ds = as.Date(ds))
+mt_test  <- test  |> filter(unique_id == uids[[1]]) |> mutate(ds = as.Date(ds))
+
+# ETS 
+ets_fit <- exp_smoothing(seasonal_period = 24) |>
+           set_engine("ets") |>
+           fit(y ~ ds, data = mt_train)
+
+# Auto ARIMA 
+arima_fit <- arima_reg(seasonal_period = 24) |>
+             set_engine("auto_arima") |>
+             fit(y ~ ds, data = mt_train)
+
+# XGB 
+xgb_fit <- boost_tree("regression") |>
+           set_engine("xgboost") |>
+           fit(y ~ ds, data = mt_train)
+
+# modeltime workflow
+modtime_fcst <- 
+  modeltime_calibrate(
+            modeltime_table(
+                xgb_fit,
+                arima_fit,
+                ets_fit
+                ), 
+              new_data = mt_test, 
+              quiet = FALSE,
+              id = "unique_id"
+            ) |>
+      modeltime_forecast(
+        new_data = mt_test,
+        conf_interval = 0.80,
+        conf_method  = "conformal_default",
+        conf_by_id = TRUE,
+        keep_data  = TRUE
+    )
+
+```
+
+
+##### plot prediction intervals
+
+```{r}
+
+modtime_fcst |>
+ggplot() + 
+  geom_ribbon(aes(x = ds, ymin = .conf_lo, ymax = .conf_hi, fill = .model_desc), 
+              alpha = 0.5) + 
+  geom_line(aes(x = ds, y = .value, color = .model_desc)) +
+  geom_line(inherit.aes = FALSE,
+            data = mt_train,
+            aes(x = as.Date(ds), y = y, color = "train")) +
+  facet_wrap(~unique_id, scales = "free") + 
+  theme_minimal() +
+  theme(legend.position = "top") + 
+  labs(subtitle = "{modeltime} Default Conformal Prediction Intervals") 
+
+```
+
+```{r}
+modtime_fcst |>
+  filter(stringr::str_detect(.model_desc, "ARIMA")) |> 
+ggplot() + 
+  geom_ribbon(aes(x = ds, ymin = .conf_lo, ymax = .conf_hi, fill = "ARIMA"), 
+              alpha = 0.5) + 
+  geom_line(aes(x = ds, y = .value, color = "ARIMA")) +
+  geom_line(inherit.aes = FALSE,
+            data = mt_train |> tail(-500),
+            aes(x = as.Date(ds), y = y, color = "train")) +
+  facet_wrap(~unique_id, scales = "free") + 
+  theme_minimal() +
+  theme(legend.position = "top") + 
+  labs(subtitle = "{modeltime} Default Conformal Prediction Intervals with ARIMA") 
+
+```
