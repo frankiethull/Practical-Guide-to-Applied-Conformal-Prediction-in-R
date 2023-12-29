@@ -1,0 +1,156 @@
+---
+title: "Chapter 8 | Conformal Prediction for Time Series and Forecasting"
+author: "frankiethull"
+format: gfm
+---
+
+
+## Chapter 8 to Practical Guide to Applied Conformal Prediction in **R**:
+   
+The following code is based on the recent book release: *Practical Guide to Applied Conformal Prediction in Python*. After posting a fuzzy GIF on X & receiving a lot of requests for a blog or Github repo, below is Chapter 8 of the practical guide with applications in R, instead of Python.   
+
+While the book is not free, the Python code is open-source and a located at the following github repo:   
+*https://github.com/PacktPublishing/Practical-Guide-to-Applied-Conformal-Prediction/blob/main/Chapter_08_NixtlaStatsforecast.ipynb*  
+
+While this is not copy/paste direct replica of the python notebook or book, this is a lite, supplemental R guide, & documentation for R users. 
+
+We will follow the example of time series and forecasting using fable & conformal prediction intervals using the **nixtla package via reticulate**. 
+
+```{r}
+# reticulate::py_install("statsforecast", pip = TRUE)
+```
+
+
+### R setup for nixtla, a python lib accessed via reticulate:
+```{r}
+library(dplyr)      # pliers keep it tidy 
+library(ggplot2)    # data viz
+library(reticulate) # pass the python example dataset :)
+
+# statsforecast r-to-py API obj
+sf <- reticulate::import("statsforecast")
+
+# or like this for submodules:
+#ets <- reticulate::py_run_string("from statsforecast.models import ETS")
+```
+
+### Load the dataset
+```{r}
+train = read.csv('https://auto-arima-results.s3.amazonaws.com/M4-Hourly.csv')
+test  = read.csv('https://auto-arima-results.s3.amazonaws.com/M4-Hourly-test.csv')
+```
+
+
+### Train the models 
+
+we will only use the first series of the dataset to reduce the total computational time.
+```{r}
+n_series <- 1
+uids <- paste0("H", seq(1:n_series))
+
+train <- train |> filter(unique_id %in% uids) |> group_by(unique_id)
+test  <- test  |> filter(unique_id %in% uids)
+
+horizon <- test |> filter(unique_id == uids[[1]]) |> nrow()
+
+```
+
+
+### nixtla model setup as R interfaces
+
+one thing R coders need to look out for is dtypes. *integers* instead of *dbl/numeric* are often needed in Python for parm setting.   
+
+In R, need to wrap with as.integer()  
+
+When importing a python module, explore the various submodules using **$**. This allows access to underlying python tools as APIs inside of R. 
+```{r}
+# compare these to the initial using str() col types are different and nixtla won't throw errors on int types
+
+train_nix <- train |> mutate(ds = as.integer(ds))
+test_nix  <- test  |> mutate(ds = as.integer(ds))
+
+models <- c(sf$models$ETS(season_length = as.integer(24)),
+            sf$models$Naive(),
+            sf$models$SeasonalNaive(season_length = as.integer(24))
+            )
+
+nixfit <- sf$StatsForecast(
+    df=train_nix,
+    models=models,
+    freq=as.integer(1)
+)
+
+levels <- c(80, 90)
+
+nixcast <- nixfit$forecast(h = as.integer(horizon), 
+                           level = as.integer(levels))
+
+nixcast |> head()
+```
+
+### plotting prediction intervals
+
+```{r}
+
+#plotly::ggplotly(
+nixcast |>
+  tidyr::pivot_longer(-ds) |>
+  ggplot() + 
+  geom_line(aes(x = ds, y = value, color = name)) + 
+  geom_line(inherit.aes = FALSE,
+            data = train_nix |> tail(24*5), 
+            aes(x = ds, y = y, color = "train")) + 
+  theme_minimal() +
+  labs(title = "Model results for Nixtla with pred intervals")
+#)
+```
+### Conformal Prediction with Nixtla
+
+once again, we will initiate models but specify conformal intervals in the model spec
+```{r}
+# conformal intervals are under utils:
+conf_int <- sf$utils$ConformalIntervals(h = as.integer(horizon),
+                                        n_windows = as.integer(2))
+
+# arima ints:
+arima_order <- sapply(c(24,0, 12), as.integer)
+# Create a list of models and instantiation parameters
+conf_models = c(
+    sf$models$ADIDA(prediction_intervals=conf_int),
+    sf$models$ARIMA(order=arima_order, 
+                    season_length=as.integer(24), 
+                    prediction_intervals=conf_int)
+)
+
+conf_nixfit <- sf$StatsForecast(
+    df=train_nix,
+    models=conf_models,
+    freq=as.integer(1)
+)
+
+levels <- c(80, 90)
+
+conf_nixcast <- conf_nixfit$forecast(h = as.integer(horizon), 
+                           level = as.integer(levels))
+
+conf_nixcast |> head()
+```
+
+```{r}
+conf_nixcast |>
+  select(ds, starts_with("ARIMA")) |>
+  ggplot() + 
+  geom_ribbon(aes(x = ds, ymin = `ARIMA-lo-80`, ymax = `ARIMA-hi-80`, fill = "80th-tile"),
+              alpha = 0.5) + 
+  geom_line(aes(x = ds, y = ARIMA, color = "arima-expected")) +
+    geom_line(inherit.aes = FALSE,
+            data = train_nix |> tail(24*5), 
+            aes(x = ds, y = y, color = "train")) + 
+    geom_line(inherit.aes = FALSE,
+              data = test_nix,
+             aes(x = ds, y = y, color = "test")) + 
+  theme_minimal() +
+  labs(title = "Nixtla with Conformal Prediction Intervals")
+
+```
+
